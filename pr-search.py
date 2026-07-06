@@ -267,17 +267,22 @@ _EPISODE_RE = re.compile(
 
 def _contiguous_run(q, toks):
     """Longest run of query tokens `q` appearing in order & contiguously in
-    the title token list `toks`, as a fraction of len(q)."""
+    the title token list `toks`, as a fraction of len(q). Returns
+    (fraction, start_index_of_best_run)."""
     if not q:
-        return 0.0
-    best = 0
+        return 0.0, 0
+    best, best_start = 0, 0
     for start in range(len(toks)):
         run = 0
         while (run < len(q) and start + run < len(toks)
                and toks[start + run] == q[run]):
             run += 1
-        best = max(best, run)
-    return best / len(q)
+        if run > best:
+            best, best_start = run, start
+    return best / len(q), best_start
+
+
+_YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2})\b")
 
 
 def relevance(query_en, year, title):
@@ -285,16 +290,30 @@ def relevance(query_en, year, title):
 
     Uses the longest *contiguous, in-order* run of query tokens — so
     "21 Grams" matches "21.Grams.2003" fully but only half-matches an anime
-    episode "... - 21". A matching year nudges it up; an episode/season
-    marker (SxxExx, "- 21", "[12]") pushes it down, since we want movies.
+    episode "... - 21".
+
+    Year is a strong signal for single-word titles (Paprika 2018 vs Paprika
+    2006, Yellowstone vs Murder at Yellowstone City 2022): an exact year match
+    nudges up; a title that carries a *different* year is heavily penalised.
+    An episode/season marker (SxxExx, "- 21", "[12]") also pushes down.
     """
     q = _tokens(query_en)
     if not q:
         return 0.0
     toks = _tokens(title)
-    score = _contiguous_run(q, toks)
-    if year and str(year) in (title or ""):
-        score = min(1.0, score + 0.2)
+    score, start = _contiguous_run(q, toks)
+    # The film title usually leads the release name. If the matched run starts
+    # deep inside the title (e.g. "Yellowstone" inside "Murder at Yellowstone
+    # City"), it's probably a different film that merely contains the word.
+    if start >= 2 and score >= 0.99:
+        score *= 0.5
+    if year and str(year).isdigit():
+        years = set(_YEAR_RE.findall(title or ""))
+        if years:
+            if str(year) in years:
+                score = min(1.0, score + 0.2)
+            elif all(abs(int(y) - int(year)) > 1 for y in years):
+                score *= 0.3  # title names a clearly different year
     if _EPISODE_RE.search(title or ""):
         score *= 0.4
     return score
@@ -366,84 +385,118 @@ def batch(args, key):
     for n in range(1, topn + 1):
         out_header += [f"magnet_{n}", f"quality_{n}", f"seeders_{n}", f"title_{n}"]
 
-    out_rows = []
-    for ri, row in enumerate(data, 1):
-        row = list(row) + [""] * (len(header) - len(row))  # pad short rows
-
-        def cell(i):
-            return row[i].strip() if i is not None and i < len(row) else ""
-
-        title_en = cell(en_i)
-        title_zh = cell(zh_i)
-        year = cell(yr_i)
-        label = title_en or title_zh or f"row{ri}"
-
-        # Query: prefer English name + year (best hit-rate on public trackers).
-        primary = title_en or title_zh
-        query = f"{primary} {year}".strip() if year else primary
-        log_pre = f"[{ri}/{len(data)}] {label!r:.50}"
-
-        if not primary:
-            print(f"{log_pre}  — no title, skipped", file=sys.stderr)
-            out_rows.append(row + [""] * (topn * 4))
-            continue
-
-        try:
-            raw = search(key, query, indexer_ids, categories)
-        except SystemExit:
-            raise
-        except Exception as e:
-            print(f"{log_pre}  — search error: {e}", file=sys.stderr)
-            out_rows.append(row + [""] * (topn * 4))
-            continue
-
-        # Fallback: if EN+year found nothing, retry with EN alone, then ZH.
-        if not raw and year and title_en:
-            raw = search(key, title_en, indexer_ids, categories)
-        if not raw and title_zh and title_zh != primary:
-            raw = search(key, f"{title_zh} {year}".strip(), indexer_ids, categories)
-
-        # Score every candidate, filter by seeders and title relevance.
-        cand = []
-        for r in raw:
-            seeders = r.get("seeders") or 0
-            if seeders < min_seeders:
-                continue
-            rel = relevance(title_en or title_zh, year, r.get("title"))
-            if rel < args.min_relevance:
-                continue
-            q = quality_of(r)
-            # Relevance is a multiplier, not an additive term: a weak title
-            # match (e.g. an anime "- 21" for "21 Grams") can't be rescued by
-            # a high seeder count. Full matches keep their quality score.
-            r["_rank"] = q["score"] * rel
-            r["_q"] = q
-            r["_rel"] = rel
-            cand.append(r)
-
-        cand.sort(key=lambda x: (-x["_rank"], -(x.get("seeders") or 0)))
-        picks = cand[:topn]
-
-        extra = []
-        for r in picks:
-            mag = resolve_magnet(r, key)
-            q = r["_q"]
-            qtag = "/".join(x for x in (q["resolution"], q["source"], q["codec"]) if x)
-            extra += [mag, qtag, str(r.get("seeders") or 0), r.get("title") or ""]
-        extra += [""] * ((topn - len(picks)) * 4)  # pad to fixed width
-        out_rows.append(row + extra)
-
-        status = (f"{len(picks)} pick(s), best="
-                  f"{picks[0]['_q']['resolution'] or '?'} "
-                  f"S:{picks[0].get('seeders')}" if picks else "no match")
-        print(f"{log_pre}  — {len(cand)} candidates → {status}")
-
     out_path = args.out or (os.path.splitext(args.batch)[0] + "_magnets.csv")
-    with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
+
+    # Resume: if the output already exists, count its data rows and skip that
+    # many input rows. Rows are written in input order, so a row count is a
+    # safe checkpoint. --restart forces a fresh run.
+    done = 0
+    if os.path.exists(out_path) and not args.restart:
+        with open(out_path, newline="", encoding="utf-8-sig") as f:
+            done = max(0, sum(1 for _ in f) - 1)
+        if done >= len(data):
+            print(f"All {len(data)} rows already done in {out_path} "
+                  f"(use --restart to redo).")
+            return
+        print(f"Resuming: {done} rows already in {out_path}, "
+              f"continuing from row {done + 1}.")
+
+    mode = "a" if done else "w"
+    f = open(out_path, mode, newline="", encoding="utf-8-sig")
+    w = csv.writer(f)
+    if not done:
         w.writerow(out_header)
-        w.writerows(out_rows)
-    print(f"\nWrote {len(out_rows)} rows → {out_path}")
+
+    processed = 0
+    try:
+        for ri, row in enumerate(data, 1):
+            if ri <= done:
+                continue
+            row = list(row) + [""] * (len(header) - len(row))  # pad short rows
+
+            def cell(i):
+                return row[i].strip() if i is not None and i < len(row) else ""
+
+            title_en = cell(en_i)
+            title_zh = cell(zh_i)
+            year = cell(yr_i)
+            label = title_en or title_zh or f"row{ri}"
+
+            # Query: prefer English name + year (best hit-rate on public trackers).
+            primary = title_en or title_zh
+            query = f"{primary} {year}".strip() if year else primary
+            log_pre = f"[{ri}/{len(data)}] {label!r:.50}"
+
+            if not primary:
+                print(f"{log_pre}  — no title, skipped", file=sys.stderr)
+                w.writerow(row + [""] * (topn * 4)); f.flush()
+                continue
+
+            try:
+                raw = search(key, query, indexer_ids, categories)
+            except SystemExit:
+                raise
+            except Exception as e:
+                print(f"{log_pre}  — search error: {e}", file=sys.stderr)
+                w.writerow(row + [""] * (topn * 4)); f.flush()
+                continue
+
+            # Fallback: if EN+year found nothing, retry with EN alone, then ZH.
+            if not raw and year and title_en:
+                raw = search(key, title_en, indexer_ids, categories)
+            if not raw and title_zh and title_zh != primary:
+                raw = search(key, f"{title_zh} {year}".strip(), indexer_ids, categories)
+
+            # Score every candidate, filter by seeders and title relevance.
+            cand = []
+            for r in raw:
+                seeders = r.get("seeders") or 0
+                if seeders < min_seeders:
+                    continue
+                rel = relevance(title_en or title_zh, year, r.get("title"))
+                if rel < args.min_relevance:
+                    continue
+                q = quality_of(r)
+                # Relevance is a multiplier, not additive: a weak title match
+                # can't be rescued by a high seeder count. Full matches keep
+                # their quality score.
+                r["_rank"] = q["score"] * rel
+                r["_q"] = q
+                r["_rel"] = rel
+                cand.append(r)
+
+            cand.sort(key=lambda x: (-x["_rank"], -(x.get("seeders") or 0)))
+
+            # Walk candidates best-first; keep only those that resolve to a
+            # real magnet: link. A proxy URL that fails to parse is skipped
+            # rather than written as a dead link, so we fall through to the
+            # next-best candidate until we have topn good ones.
+            picks = []
+            for r in cand:
+                if len(picks) >= topn:
+                    break
+                mag = resolve_magnet(r, key)
+                if not mag.startswith("magnet:"):
+                    continue
+                r["_magnet"] = mag
+                picks.append(r)
+
+            extra = []
+            for r in picks:
+                q = r["_q"]
+                qtag = "/".join(x for x in (q["resolution"], q["source"], q["codec"]) if x)
+                extra += [r["_magnet"], qtag, str(r.get("seeders") or 0), r.get("title") or ""]
+            extra += [""] * ((topn - len(picks)) * 4)  # pad to fixed width
+            w.writerow(row + extra); f.flush()
+            processed += 1
+
+            status = (f"{len(picks)} pick(s), best="
+                      f"{picks[0]['_q']['resolution'] or '?'} "
+                      f"S:{picks[0].get('seeders')}" if picks else "no match")
+            print(f"{log_pre}  — {len(cand)} candidates → {status}")
+    finally:
+        f.close()
+    print(f"\nDone. Processed {processed} rows this run → {out_path}")
 
 
 def main():
@@ -471,8 +524,10 @@ def main():
     b.add_argument("--batch", metavar="CSV", help="input CSV to process row by row")
     b.add_argument("--out", metavar="CSV", help="output path (default: <input>_magnets.csv)")
     b.add_argument("--top", type=int, default=3, help="magnets to keep per film (default 3)")
-    b.add_argument("--min-relevance", type=float, default=0.5,
-                   help="min title-token match 0..1 to accept a result (default 0.5)")
+    b.add_argument("--min-relevance", type=float, default=0.85,
+                   help="min title match 0..1 to accept a result (default 0.85)")
+    b.add_argument("--restart", action="store_true",
+                   help="ignore any existing output and reprocess from row 1")
     b.add_argument("--no-header", action="store_true",
                    help="input CSV has no header row")
     b.add_argument("--en-col", help="English-title column (name or 1-based index)")
