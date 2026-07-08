@@ -6,6 +6,8 @@ Examples:
   pr-search -n 30 debian                 # show up to 30 results
   pr-search -i 5,3 nyaa one piece        # limit to indexer ids 5 and 3
   pr-search -c 2000 dune                 # only category 2000 (Movies)
+  pr-search 帕丁顿熊 2014                   # default: domestic-first, no remux/disc
+  pr-search --remux --no-cn-first dune   # opt out of the two defaults
   pr-search --list-indexers              # list configured indexers and exit
   pr-search -m ubuntu | pbcopy           # print only magnet links (pipe-friendly)
   pr-search --copy 2 ubuntu              # copy the magnet of result #2 to clipboard
@@ -199,6 +201,38 @@ def magnet_of(r):
     return mu or r.get("downloadUrl") or ""
 
 
+# ---- seeder-count reliability --------------------------------------------
+# Some indexers are magnet/DHT aggregators (52BT, BTdirectory, Magnet Cat …)
+# that don't track a swarm, so they stamp every result with a constant
+# placeholder (seeders=1). Sorting/filtering on that number is meaningless and,
+# worse, batch mode's --min-seeders would drop every result from such a site.
+# We detect it per-indexer within a result set: if an indexer returns several
+# results whose seeder counts never vary and sit at <=1, treat its seeder
+# numbers as UNKNOWN rather than real.
+def flag_unreliable_seeders(results):
+    """Tag results whose indexer reports a constant placeholder seeder count.
+
+    Mutates each result in place: sets r["_seed_unknown"] = True/False.
+    """
+    by_indexer = {}
+    for r in results:
+        by_indexer.setdefault(r.get("indexerId"), []).append(r)
+    for group in by_indexer.values():
+        seeds = [g.get("seeders") for g in group if g.get("seeders") is not None]
+        # Need a few samples to conclude "never varies"; a single result that
+        # happens to have 1 seeder is not evidence of a broken indexer.
+        degenerate = (len(seeds) >= 3 and len(set(seeds)) == 1 and seeds[0] <= 1)
+        for g in group:
+            g["_seed_unknown"] = degenerate
+
+
+def seeders_display(r):
+    """Seeder count for display: None when the indexer's number is unreliable."""
+    if r.get("_seed_unknown"):
+        return None
+    return r.get("seeders")
+
+
 # ---- quality scoring (Prowlarr has no bitrate field; parse from title) ----
 # Prowlarr returns no resolution/source/codec/bitrate — the only signal is the
 # release title text plus seeders and file size. We parse the title for the
@@ -242,13 +276,115 @@ def quality_of(r):
     # Weighted: resolution dominates, then source/codec, then a capped seeders
     # contribution so a mega-seeded SD rip can't outrank a 1080p one. Tiny
     # files (likely fake/samples) are penalised.
-    seed_pts = min(seeders, 200) * 0.5
+    # When the indexer's seeder count is a placeholder (see
+    # flag_unreliable_seeders), give a small neutral credit instead of scoring
+    # it as "1 seeder" — otherwise every result from an aggregator site is
+    # unfairly ranked as near-dead.
+    if r.get("_seed_unknown"):
+        seed_pts = 20  # neutral: ~40 real seeders' worth, neither boosted nor buried
+    else:
+        seed_pts = min(seeders, 200) * 0.5
     penalty = -30 if size_gb and size_gb < 0.2 else 0
     score = res_s * 25 + src_s * 8 + cod_s * 5 + seed_pts + penalty
     return {
         "score": round(score, 1),
         "resolution": res_l, "source": src_l, "codec": cod_l,
     }
+
+
+# ---- subtitle handling & origin (parsed from the release title) -----------
+# The user wants to (a) skip releases with *hardcoded* subtitles (内嵌/硬字幕 —
+# burned into the picture, can't be turned off) in favour of soft/muxed/
+# external subs, and (b) prefer *domestic* (Chinese) releases. The release
+# title is the only signal Prowlarr gives us, so these are heuristics, not
+# guarantees.
+_HARDSUB_RE = re.compile(r"内嵌|硬字幕|硬字|内嵌中字", re.I)
+_SOFTSUB_RE = re.compile(
+    r"内封|软字幕|外挂|外掛|特效字幕|简繁英|简繁双语|双语字幕|简繁中字|"
+    r"简繁|繁简|chs&?eng|cht&?eng|ass字幕", re.I)
+_CHSUB_RE = re.compile(r"中字|中英|中文字幕|国语中字|简体中文|繁体中文|简中|繁中|双字", re.I)
+# A "TC/CAM/枪版" release that carries Chinese subs almost always has them
+# burned in; a BluRay/WEB/Remux almost always ships them as a selectable track.
+# T[SC] is matched with letter-boundaries (not \b) so "TC1080P"/"HDTS" hit but
+# "watch"/"TrueHD" don't.
+_CAMISH_RE = re.compile(
+    r"(?<![a-z])(?:hd)?t[sc](?![a-z])|抢先|枪版|槍版|偷拍|喳", re.I)
+
+
+def subtitle_of(r):
+    """Classify a release's subtitle handling from its title.
+
+    Returns one of:
+      'hard' — subtitles burned into the picture (avoid)
+      'soft' — muxed/external/selectable subtitles (prefer)
+      'cn'   — has Chinese subs but the type is unclear
+      ''     — no subtitle signal in the title
+    """
+    t = r.get("title") or ""
+    if _HARDSUB_RE.search(t):
+        return "hard"
+    if _SOFTSUB_RE.search(t):
+        return "soft"
+    if _CHSUB_RE.search(t):
+        src = _match_first(t, SOURCE_SCORES)[1]
+        if src == "CAM" or _CAMISH_RE.search(t):
+            return "hard"
+        if src in ("Remux", "BluRay", "WEB"):
+            return "soft"
+        return "cn"
+    return ""
+
+
+_CN_MARK_RE = re.compile(
+    r"国语|國語|国配|國配|粤语|粵語|华语|華語|中字|简繁|繁简|简体|繁体|\bCHN\b|"
+    r"高清影视之家|中文字幕|国英|双语", re.I)
+_CJK_RE = re.compile(r"[一-鿿]")
+_KANA_RE = re.compile(r"[぀-ヿ]")  # Japanese hiragana/katakana
+
+
+def is_domestic(r):
+    """Heuristic: does this look like a Chinese-origin / Chinese-audio release?"""
+    t = r.get("title") or ""
+    if _CN_MARK_RE.search(t):
+        return True
+    # A title carrying several Han characters (and no Japanese kana, to avoid
+    # mislabelling anime) reads as a domestic release.
+    return len(_CJK_RE.findall(t)) >= 2 and not _KANA_RE.search(t)
+
+
+# ---- disc-image / remux detection (poor playback compatibility) -----------
+# "Original disc" releases — full UHD/BD folder rips (BDMV/ISO) and Remuxes —
+# are huge (tens of GB) and often carry raw HEVC + Dolby Vision / lossless
+# audio in a container many players & TVs choke on. Re-encoded releases carry
+# a software encoder tag (x264/x265) and are far more compatible. This flags
+# the disc/remux kind so it can be excluded.
+#
+# Encoder-agnostic disc markers: "UHD BluRay" / "Blu-ray Disc" / "Complete
+# BluRay" with no x264/x265 re-encode tag ⇒ it's the disc itself, not a rip.
+_DISC_RE = re.compile(r"\bUHD\s*Blu-?ray\b|\bBlu-?ray\s*Disc\b|\bcomplete\s*bluray\b", re.I)
+
+
+def is_remux(r):
+    """True if the release looks like a disc image / remux (huge, low-compat).
+
+    Signals, any of:
+      • an explicit remux / 原盘 / BDMV / ISO tag;
+      • a "UHD BluRay"-style disc marker with NO x264/x265 re-encode tag
+        — i.e. the untouched disc;
+      • sheer size: a release above ~40 GB is a disc/remux in practice.
+    """
+    t = r.get("title") or ""
+    if re.search(r"remux|原盘|原盤|\bBDMV\b|\bISO\b", t, re.I):
+        return True
+    size_gb = (r.get("size") or 0) / 1e9
+    if size_gb >= 40:  # nothing re-encoded is this big
+        return True
+    # Disc marker present and no software-encoder tag ⇒ raw disc.
+    if _DISC_RE.search(t) and not re.search(r"\bx26[45]\b", t, re.I):
+        return True
+    return False
+
+
 
 
 # ---- title relevance (Prowlarr has no genre; match title tokens instead) ---
@@ -447,11 +583,21 @@ def batch(args, key):
             if not raw and title_zh and title_zh != primary:
                 raw = search(key, f"{title_zh} {year}".strip(), indexer_ids, categories)
 
+            # Flag indexers that report placeholder seeder counts so the
+            # seeder filter below doesn't wipe out every result from an
+            # aggregator site (52BT, BTdirectory, Magnet Cat …).
+            flag_unreliable_seeders(raw)
+
             # Score every candidate, filter by seeders and title relevance.
             cand = []
             for r in raw:
                 seeders = r.get("seeders") or 0
-                if seeders < min_seeders:
+                # Only enforce --min-seeders where the count is trustworthy.
+                if not r.get("_seed_unknown") and seeders < min_seeders:
+                    continue
+                if args.no_hardsub and subtitle_of(r) == "hard":
+                    continue
+                if args.no_remux and is_remux(r):
                     continue
                 rel = relevance(title_en or title_zh, year, r.get("title"))
                 if rel < args.min_relevance:
@@ -463,9 +609,19 @@ def batch(args, key):
                 r["_rank"] = q["score"] * rel
                 r["_q"] = q
                 r["_rel"] = rel
+                r["_cn"] = is_domestic(r)
                 cand.append(r)
 
-            cand.sort(key=lambda x: (-x["_rank"], -(x.get("seeders") or 0)))
+            # Tie-break sort key: real seeders descending, unknown counts last.
+            def _seed_tb(x):
+                return -1 if x.get("_seed_unknown") else (x.get("seeders") or 0)
+            # --cn-first floats domestic releases to the top, ordered among
+            # themselves (and among the rest) by rank then seeders.
+            if args.cn_first:
+                cand.sort(key=lambda x: (0 if x["_cn"] else 1,
+                                         -x["_rank"], -_seed_tb(x)))
+            else:
+                cand.sort(key=lambda x: (-x["_rank"], -_seed_tb(x)))
 
             # Walk candidates best-first; keep only those that resolve to a
             # real magnet: link. A proxy URL that fails to parse is skipped
@@ -484,15 +640,30 @@ def batch(args, key):
             extra = []
             for r in picks:
                 q = r["_q"]
-                qtag = "/".join(x for x in (q["resolution"], q["source"], q["codec"]) if x)
-                extra += [r["_magnet"], qtag, str(r.get("seeders") or 0), r.get("title") or ""]
+                sub = subtitle_of(r)
+                sub_tag = {"hard": "内嵌", "soft": "内封", "cn": "中字"}.get(sub, "")
+                bits = [q["resolution"], q["source"], q["codec"]]
+                if r.get("_cn"):
+                    bits.append("国内")
+                if is_remux(r):
+                    bits.append("原盘")
+                if sub_tag:
+                    bits.append(sub_tag)
+                qtag = "/".join(x for x in bits if x)
+                sd = seeders_display(r)
+                seed_cell = "?" if sd is None else str(sd)
+                extra += [r["_magnet"], qtag, seed_cell, r.get("title") or ""]
             extra += [""] * ((topn - len(picks)) * 4)  # pad to fixed width
             w.writerow(row + extra); f.flush()
             processed += 1
 
-            status = (f"{len(picks)} pick(s), best="
-                      f"{picks[0]['_q']['resolution'] or '?'} "
-                      f"S:{picks[0].get('seeders')}" if picks else "no match")
+            if picks:
+                bsd = seeders_display(picks[0])
+                status = (f"{len(picks)} pick(s), best="
+                          f"{picks[0]['_q']['resolution'] or '?'} "
+                          f"S:{'?' if bsd is None else bsd}")
+            else:
+                status = "no match"
             print(f"{log_pre}  — {len(cand)} candidates → {status}")
     finally:
         f.close()
@@ -511,6 +682,18 @@ def main():
     ap.add_argument("-s", "--sort", choices=["seeders", "size", "age"],
                     default="seeders", help="sort key (default seeders)")
     ap.add_argument("--min-seeders", type=int, default=0, help="filter out low-seed results")
+    ap.add_argument("--no-hardsub", action="store_true",
+                    help="drop releases whose subtitles look burned-in (内嵌/硬字幕, TC/CAM 中字)")
+    # Defaults on: domestic-first ordering and dropping disc images/remuxes.
+    # Each has an opt-out (--no-cn-first / --remux) that flips the same dest.
+    ap.add_argument("--cn-first", dest="cn_first", action="store_true", default=True,
+                    help="sort domestic (国语/中字/华语) releases first (default on)")
+    ap.add_argument("--no-cn-first", dest="cn_first", action="store_false",
+                    help="disable domestic-first ordering")
+    ap.add_argument("--no-remux", dest="no_remux", action="store_true", default=True,
+                    help="drop disc images / remuxes (原盘/Remux/BDMV, huge & poor player compatibility; default on)")
+    ap.add_argument("--remux", dest="no_remux", action="store_false",
+                    help="keep disc images / remuxes in results")
     ap.add_argument("-m", "--magnets", action="store_true",
                     help="print only magnet links, one per line")
     ap.add_argument("--copy", type=int, metavar="N",
@@ -558,15 +741,36 @@ def main():
 
     results = api_get("/api/v1/search", key, params)
 
-    if args.min_seeders:
-        results = [r for r in results if (r.get("seeders") or 0) >= args.min_seeders]
+    flag_unreliable_seeders(results)
 
+    # --min-seeders filters on real seeder counts only. Results from indexers
+    # with placeholder counts (S:?) are kept regardless — we can't judge them,
+    # so we don't drop them.
+    if args.min_seeders:
+        results = [r for r in results
+                   if r.get("_seed_unknown")
+                   or (r.get("seeders") or 0) >= args.min_seeders]
+
+    if args.no_hardsub:
+        results = [r for r in results if subtitle_of(r) != "hard"]
+
+    if args.no_remux:
+        results = [r for r in results if not is_remux(r)]
+
+    # For sorting by seeders, an unknown count sorts as -1 (after real counts,
+    # so genuinely-seeded results lead) rather than as its fake value.
+    def seed_sort(r):
+        return -1 if r.get("_seed_unknown") else (r.get("seeders") or 0)
     keymap = {
-        "seeders": lambda r: -(r.get("seeders") or 0),
+        "seeders": lambda r: -seed_sort(r),
         "size": lambda r: -(r.get("size") or 0),
         "age": lambda r: (r.get("ageHours") if r.get("ageHours") is not None else 1e12),
     }
-    results.sort(key=keymap[args.sort])
+    base = keymap[args.sort]
+    # --cn-first is a primary sort key layered on top of the chosen sort: all
+    # domestic releases float up, ordered among themselves by the base key.
+    sort_key = (lambda r: (0 if is_domestic(r) else 1, base(r))) if args.cn_first else base
+    results.sort(key=sort_key)
     results = results[: args.limit]
 
     if not results:
@@ -614,16 +818,33 @@ def main():
 
     # Pretty table
     for n, r in enumerate(results, 1):
-        seed = r.get("seeders") or 0
         leech = r.get("leechers") or 0
-        seed_col = GREEN if seed >= 10 else (YELLOW if seed >= 1 else RED)
+        sd = seeders_display(r)  # None when the indexer's count is unreliable
+        if sd is None:
+            seed_str, seed_col = "S:?", DIM
+        else:
+            seed_col = GREEN if sd >= 10 else (YELLOW if sd >= 1 else RED)
+            seed_str = f"S:{sd:<5}"
         title = r.get("title") or ""
         print(f"{c(BOLD, f'{n:>3}.')} {title}")
+        sub = subtitle_of(r)
+        tags = []
+        if is_domestic(r):
+            tags.append(c(GREEN, "国内"))
+        if is_remux(r):
+            tags.append(c(RED, "原盘"))
+        if sub == "hard":
+            tags.append(c(RED, "内嵌"))
+        elif sub == "soft":
+            tags.append(c(GREEN, "内封/外挂"))
+        elif sub == "cn":
+            tags.append(c(YELLOW, "中字?"))
+        tag_str = ("  " + " ".join(tags)) if tags else ""
         meta = (
-            f"     {c(seed_col, f'S:{seed:<5}')} {c(DIM, f'L:{leech:<5}')} "
+            f"     {c(seed_col, f'{seed_str:<7}')} {c(DIM, f'L:{leech:<5}')} "
             f"{c(CYAN, human_size(r.get('size')) ):<18} "
             f"{c(DIM, human_age(r.get('ageHours')) ):<12} "
-            f"{c(DIM, r.get('indexer',''))}"
+            f"{c(DIM, r.get('indexer',''))}{tag_str}"
         )
         print(meta)
         mag = magnet_of(r)

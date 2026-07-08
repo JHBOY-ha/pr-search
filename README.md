@@ -63,6 +63,9 @@ pr-search [选项] 搜索词...
 | `-c, --categories a,b` | 只搜指定分类 id（如 `2000`=电影，`5000`=电视） |
 | `-s, --sort KEY` | 排序方式：`seeders`（默认）/ `size` / `age` |
 | `--min-seeders N` | 过滤掉做种数低于 N 的结果 |
+| `--cn-first` / `--no-cn-first` | 把**国内片源**（国语/中字/华语/CHN 等）排到前面（**默认开启**，用 `--no-cn-first` 关闭） |
+| `--no-remux` / `--remux` | 过滤掉**原盘/Remux**（原盘、Remux、BDMV，体积巨大、播放器兼容性差；**默认开启**，用 `--remux` 保留） |
+| `--no-hardsub` | 过滤掉字幕疑似**内嵌/硬字幕**的片源（内嵌、硬字，以及 TC/CAM 枪版带中字的；默认关闭） |
 | `-m, --magnets` | 只输出磁力链接，每行一条（适合管道） |
 | `--copy N` | 复制第 N 条结果的磁力到剪贴板 |
 | `--save N` | 把第 N 条结果的 `.torrent` 文件下载到当前目录 |
@@ -92,6 +95,15 @@ pr-search ubuntu 24.04
 
 # 只看做种数 >= 5 的电影，限定索引器 1、5、4
 pr-search --min-seeders 5 -c 2000 -i 1,5,4 There Is No Evil
+
+# 默认已开启「国内优先 + 排除原盘」，直接搜即可（结果行会标注 国内 / 原盘 / 内封·外挂 / 中字?）
+pr-search 流浪地球 2019
+
+# 想看原盘、或关掉国内优先时临时覆盖
+pr-search --remux --no-cn-first 流浪地球 2019
+
+# 进一步排除内嵌字幕的版本
+pr-search --no-hardsub 流浪地球 2019
 
 # 复制第 1 条结果的磁力到剪贴板（代理结果会自动解析成真磁力）
 pr-search --copy 1 ubuntu
@@ -130,6 +142,9 @@ pr-search --batch films.csv --top 5 --min-seeders 10 --out result.csv
 | `--out CSV` | 输出路径（默认 `<输入名>_magnets.csv`） |
 | `--top N` | 每部片回填的磁力数量（默认 3） |
 | `--min-seeders N` | 做种数下限（批量模式默认 5） |
+| `--cn-first` / `--no-cn-first` | 每部片的候选里国内片源优先回填（默认开启） |
+| `--no-remux` / `--remux` | 过滤掉原盘/Remux（默认开启，用 `--remux` 保留） |
+| `--no-hardsub` | 过滤掉字幕疑似内嵌/硬字幕的片源（默认关闭） |
 | `--min-relevance F` | 标题匹配度阈值 0~1（默认 0.5），低于此值的结果被丢弃 |
 | `--no-header` | 输入 CSV 没有表头行 |
 | `--en-col` | 英文名列（列名或从 1 开始的序号） |
@@ -162,8 +177,10 @@ pr-search --batch films.csv --top 5 --min-seeders 10 --out result.csv
    - 疑似假种（文件 <200MB）扣分
    - 最终排名 = 质量分 × 相关性，相关性作为乘数压制噪音
 4. **回填**：每部片取前 `--top` 名，每个结果写入 4 列：
-   `magnet_N`（标准磁力）、`quality_N`（如 `1080p/BluRay/x265`）、
-   `seeders_N`（做种数）、`title_N`（原始发布标题）。
+   `magnet_N`（标准磁力）、`quality_N`（如 `1080p/BluRay/x265`，另会带
+   `国内` / `原盘` / `内封` / `中字` 等标签）、`seeders_N`（做种数）、
+   `title_N`（原始发布标题）。默认已开启「国内优先 + 排除原盘」，可用
+   `--no-cn-first` / `--remux` 覆盖，`--no-hardsub` 进一步排除内嵌字幕。
 
 > 注意：因为逐行都要请求 Prowlarr（还要解析 .torrent），批量处理**较慢**，
 > 每部片约几秒。片单大时建议先小批量试跑。
@@ -176,3 +193,14 @@ pr-search --batch films.csv --top 5 --min-seeders 10 --out result.csv
 - **代理型站点**（如 1337x）：搜索结果只给一个 Prowlarr 代理 URL，访问它会返回真正的 `.torrent` 文件。此时脚本会在你使用 `--copy` / `-m` / `--save` 时按需下载该文件并解析成标准磁力链接。
 
 表格显示时，`magnet` 绿色标签表示可直接拿到磁力，`proxy` 黄色标签表示需要解析（在复制/保存时自动完成）。因为逐行解析会产生网络请求，所以列表阶段不会预先解析，只在你真正需要某一条时才处理。
+
+### 关于做种数（seeders）
+
+部分索引器是**磁力/DHT 聚合站**（如 52BT、BTdirectory、Magnet Cat），它们本身不跟踪 swarm，会给每条结果填一个固定占位值（通常 `seeders=1`），并不是真实做种数。脚本会自动识别这种情况——当某索引器在同一次搜索里返回的做种数**完全不变且 ≤1** 时，判定其做种数不可信，于是：
+
+- 表格里显示成 `S:?` 而不是骗人的 `S:1`；批量 CSV 的 `seeders_N` 列写成 `?`；
+- **不会**被 `--min-seeders` 过滤掉（无从判断，就不误杀）；
+- 按 `seeders` 排序时排在有真实做种数据的结果之后；
+- 质量打分里做种数分取中性值，既不加分也不因「1 种」被压低。
+
+真正的 tracker 站（Nyaa.si、BigFANGroup 等）返回的做种数是真实的，照常参与过滤和排序。
