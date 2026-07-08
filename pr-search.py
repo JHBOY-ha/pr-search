@@ -521,6 +521,25 @@ def search(key, query, indexer_ids=None, categories=None, fetch=150):
     return api_get("/api/v1/search", key, params)
 
 
+def search_retry(key, query, indexer_ids=None, categories=None, fetch=150,
+                 attempts=3):
+    """search() with retries on transient failures (timeout / connection reset).
+
+    Prowlarr aggregates every indexer into one request, so a single slow or
+    stuck indexer can time the whole call out. That's usually transient — a
+    retry succeeds. HTTP errors (bad request etc.) are not retried.
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            return search(key, query, indexer_ids, categories, fetch)
+        except SystemExit:
+            raise  # HTTP/URL errors from api_get — not transient, don't retry
+        except Exception as e:
+            last = e  # timeout, connection reset, malformed JSON, …
+    raise last
+
+
 # ---- batch CSV processing --------------------------------------------------
 def _resolve_col(header, spec, default_names):
     """Map a --xxx-col spec (name or 1-based index) to a 0-based column index.
@@ -623,19 +642,24 @@ def batch(args, key):
                 continue
 
             try:
-                raw = search(key, query, indexer_ids, categories)
+                raw = search_retry(key, query, indexer_ids, categories)
             except SystemExit:
                 raise
             except Exception as e:
-                print(f"{log_pre}  — search error: {e}", file=sys.stderr)
+                print(f"{log_pre}  — search error (after retries): {e}", file=sys.stderr)
                 w.writerow(row + [""] * (topn * 4)); f.flush()
                 continue
 
             # Fallback: if EN+year found nothing, retry with EN alone, then ZH.
-            if not raw and year and title_en:
-                raw = search(key, title_en, indexer_ids, categories)
-            if not raw and title_zh and title_zh != primary:
-                raw = search(key, f"{title_zh} {year}".strip(), indexer_ids, categories)
+            try:
+                if not raw and year and title_en:
+                    raw = search_retry(key, title_en, indexer_ids, categories)
+                if not raw and title_zh and title_zh != primary:
+                    raw = search_retry(key, f"{title_zh} {year}".strip(), indexer_ids, categories)
+            except SystemExit:
+                raise
+            except Exception:
+                pass  # keep whatever the primary query returned (possibly none)
 
             # Flag indexers that report placeholder seeder counts so the
             # seeder filter below doesn't wipe out every result from an
