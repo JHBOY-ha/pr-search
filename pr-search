@@ -6,8 +6,9 @@ Examples:
   pr-search -n 30 debian                 # show up to 30 results
   pr-search -i 5,3 nyaa one piece        # limit to indexer ids 5 and 3
   pr-search -c 2000 dune                 # only category 2000 (Movies)
-  pr-search 帕丁顿熊 2014                   # default: domestic-first, no remux/disc
-  pr-search --remux --no-cn-first dune   # opt out of the two defaults
+  pr-search 帕丁顿熊 2014                   # default: domestic-first, no remux, bitrate-gated
+  pr-search --runtime 95 帕丁顿熊 2014     # tell it the film length for a tighter bitrate gate
+  pr-search --keep-lowbitrate dune       # disable the bitrate gate
   pr-search --list-indexers              # list configured indexers and exit
   pr-search -m ubuntu | pbcopy           # print only magnet links (pipe-friendly)
   pr-search --copy 2 ubuntu              # copy the magnet of result #2 to clipboard
@@ -385,6 +386,53 @@ def is_remux(r):
     return False
 
 
+# ---- bitrate quality gate (approximated from size / runtime) --------------
+# The user wants to drop releases whose video bitrate is below a per-resolution
+# floor:  4K/2160p ≥5000 kbps · 1080p ≥2000 · 720p ≥1000.
+#
+# Prowlarr gives no bitrate and no runtime — only file size. So we approximate:
+#     bitrate_kbps ≈ size_bytes * 8 / runtime_seconds / 1000
+# Two deliberate biases, both toward *keeping* borderline files (we'd rather
+# miss a bad rip than delete a good one):
+#   • This is the *total* bitrate (video+audio); real video bitrate is a bit
+#     lower, so the estimate runs high — lenient, especially for multi-audio
+#     domestic releases.
+#   • A short default runtime makes the estimate higher, not lower.
+# Anything whose resolution we can't read, or with no runtime at all, is NOT
+# gated (returned as passing) — we never guess a file into deletion.
+MIN_BITRATE = {  # kbps floor per resolution label (from quality_of)
+    "2160p": 5000,
+    "1080p": 2000,
+    "720p": 1000,
+    # 480p/SD left ungated — the standard table doesn't cover it.
+}
+DEFAULT_RUNTIME_MIN = 100  # fallback film length when none is known (minutes)
+
+
+def est_bitrate_kbps(r, runtime_min):
+    """Approximate total bitrate in kbps from size and runtime. None if unknown."""
+    size = r.get("size") or 0
+    if not size or not runtime_min or runtime_min <= 0:
+        return None
+    return size * 8 / (runtime_min * 60) / 1000
+
+
+def bitrate_ok(r, runtime_min, table=None):
+    """True if the release meets the per-resolution bitrate floor.
+
+    Passes (returns True) when the resolution is unknown/ungated or the bitrate
+    can't be estimated — the gate only ever *rejects* a file it can positively
+    judge as too low.
+    """
+    table = table if table is not None else MIN_BITRATE
+    res = quality_of(r)["resolution"]
+    floor = table.get(res)
+    if not floor:
+        return True  # unknown or ungated resolution → don't judge
+    br = est_bitrate_kbps(r, runtime_min)
+    if br is None:
+        return True  # no size/runtime → can't judge → keep
+    return br >= floor
 
 
 # ---- title relevance (Prowlarr has no genre; match title tokens instead) ---
@@ -507,6 +555,8 @@ def batch(args, key):
     en_i = _resolve_col(header, args.en_col, ["title_en", "english", "en"])
     zh_i = _resolve_col(header, args.zh_col, ["title", "title_zh", "name", "电影名"])
     yr_i = _resolve_col(header, args.year_col, ["year", "年份", "年代"])
+    rt_i = _resolve_col(header, args.runtime_col,
+                        ["runtime", "duration", "时长", "片长", "分钟"])
     if en_i is None and zh_i is None:
         sys.exit("Could not find a title column. Use --en-col / --zh-col to set it "
                  f"(header seen: {header}).")
@@ -556,6 +606,10 @@ def batch(args, key):
             title_en = cell(en_i)
             title_zh = cell(zh_i)
             year = cell(yr_i)
+            # Per-film runtime for the bitrate estimate: use the CSV column if
+            # present & numeric, else fall back to --runtime.
+            rt_raw = re.sub(r"[^\d]", "", cell(rt_i))  # tolerate "95 min" etc.
+            runtime_min = int(rt_raw) if rt_raw else args.runtime
             label = title_en or title_zh or f"row{ri}"
 
             # Query: prefer English name + year (best hit-rate on public trackers).
@@ -598,6 +652,8 @@ def batch(args, key):
                 if args.no_hardsub and subtitle_of(r) == "hard":
                     continue
                 if args.no_remux and is_remux(r):
+                    continue
+                if args.min_bitrate and not bitrate_ok(r, runtime_min):
                     continue
                 rel = relevance(title_en or title_zh, year, r.get("title"))
                 if rel < args.min_relevance:
@@ -694,6 +750,16 @@ def main():
                     help="drop disc images / remuxes (原盘/Remux/BDMV, huge & poor player compatibility; default on)")
     ap.add_argument("--remux", dest="no_remux", action="store_false",
                     help="keep disc images / remuxes in results")
+    # Bitrate gate: default on. --keep-lowbitrate opts out; --runtime sets the
+    # assumed film length used to estimate bitrate from file size.
+    ap.add_argument("--min-bitrate", dest="min_bitrate", action="store_true", default=True,
+                    help="drop releases below the per-resolution bitrate floor "
+                         "(4K≥5000/1080p≥2000/720p≥1000 kbps; default on)")
+    ap.add_argument("--keep-lowbitrate", dest="min_bitrate", action="store_false",
+                    help="keep low-bitrate releases (disable the bitrate gate)")
+    ap.add_argument("--runtime", type=int, metavar="MIN", default=DEFAULT_RUNTIME_MIN,
+                    help=f"assumed film length in minutes for bitrate estimation "
+                         f"(default {DEFAULT_RUNTIME_MIN})")
     ap.add_argument("-m", "--magnets", action="store_true",
                     help="print only magnet links, one per line")
     ap.add_argument("--copy", type=int, metavar="N",
@@ -716,6 +782,9 @@ def main():
     b.add_argument("--en-col", help="English-title column (name or 1-based index)")
     b.add_argument("--zh-col", help="Chinese-title column (name or 1-based index)")
     b.add_argument("--year-col", help="year column (name or 1-based index)")
+    b.add_argument("--runtime-col",
+                   help="runtime-in-minutes column for bitrate estimation "
+                        "(name or 1-based index; falls back to --runtime)")
     args = ap.parse_args()
 
     key = get_api_key()
@@ -756,6 +825,9 @@ def main():
 
     if args.no_remux:
         results = [r for r in results if not is_remux(r)]
+
+    if args.min_bitrate:
+        results = [r for r in results if bitrate_ok(r, args.runtime)]
 
     # For sorting by seeders, an unknown count sorts as -1 (after real counts,
     # so genuinely-seeded results lead) rather than as its fake value.
@@ -840,9 +912,12 @@ def main():
         elif sub == "cn":
             tags.append(c(YELLOW, "中字?"))
         tag_str = ("  " + " ".join(tags)) if tags else ""
+        br = est_bitrate_kbps(r, args.runtime)
+        br_str = f"~{br/1000:.1f}Mbps" if br else "~?"
         meta = (
             f"     {c(seed_col, f'{seed_str:<7}')} {c(DIM, f'L:{leech:<5}')} "
             f"{c(CYAN, human_size(r.get('size')) ):<18} "
+            f"{c(DIM, f'{br_str:<10}')} "
             f"{c(DIM, human_age(r.get('ageHours')) ):<12} "
             f"{c(DIM, r.get('indexer',''))}{tag_str}"
         )
