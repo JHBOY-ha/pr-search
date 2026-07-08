@@ -66,7 +66,7 @@ pr-search [选项] 搜索词...
 | `--cn-first` / `--no-cn-first` | 把**国内片源**（国语/中字/华语/CHN 等）排到前面（**默认开启**，用 `--no-cn-first` 关闭） |
 | `--no-remux` / `--remux` | 过滤掉**原盘/Remux**（原盘、Remux、BDMV，体积巨大、播放器兼容性差；**默认开启**，用 `--remux` 保留） |
 | `--min-bitrate` / `--keep-lowbitrate` | 过滤掉**码率过低**的片源（4K≥5000 / 1080p≥2000 / 720p≥1000 kbps；**默认开启**，用 `--keep-lowbitrate` 关闭） |
-| `--runtime MIN` | 估算码率用的影片时长（分钟，默认 100）；Prowlarr 不提供时长，码率≈体积×8÷时长 |
+| `--duration MIN` | 估算码率用的影片时长（分钟，默认 100）；Prowlarr 不提供时长，码率≈体积×8÷时长 |
 | `--no-hardsub` | 过滤掉字幕疑似**内嵌/硬字幕**的片源（内嵌、硬字，以及 TC/CAM 枪版带中字的；默认关闭） |
 | `-m, --magnets` | 只输出磁力链接，每行一条（适合管道） |
 | `--copy N` | 复制第 N 条结果的磁力到剪贴板 |
@@ -147,14 +147,14 @@ pr-search --batch films.csv --top 5 --min-seeders 10 --out result.csv
 | `--cn-first` / `--no-cn-first` | 每部片的候选里国内片源优先回填（默认开启） |
 | `--no-remux` / `--remux` | 过滤掉原盘/Remux（默认开启，用 `--remux` 保留） |
 | `--min-bitrate` / `--keep-lowbitrate` | 过滤掉码率过低的片源（默认开启，用 `--keep-lowbitrate` 关闭） |
-| `--runtime MIN` | 估算码率用的默认时长（分钟，默认 100），CSV 有 runtime 列时优先用列值 |
+| `--duration MIN` | 估算码率用的默认时长（分钟，默认 100），CSV 有 duration 列时优先用列值 |
 | `--no-hardsub` | 过滤掉字幕疑似内嵌/硬字幕的片源（默认关闭） |
 | `--min-relevance F` | 标题匹配度阈值 0~1（默认 0.5），低于此值的结果被丢弃 |
 | `--no-header` | 输入 CSV 没有表头行 |
 | `--en-col` | 英文名列（列名或从 1 开始的序号） |
 | `--zh-col` | 中文名列（列名或序号） |
 | `--year-col` | 年份列（列名或序号） |
-| `--runtime-col` | 时长列（分钟；列名或序号，用于逐片估算码率） |
+| `--duration-col` | 时长列（分钟；列名或序号，用于逐片估算码率） |
 
 ### 列自动识别
 
@@ -163,9 +163,9 @@ pr-search --batch films.csv --top 5 --min-seeders 10 --out result.csv
 - 英文名：`title_en` / `english` / `en`
 - 中文名：`title` / `title_zh` / `name` / `电影名`
 - 年份：`year` / `年份` / `年代`
-- 时长：`runtime` / `duration` / `时长` / `片长` / `分钟`（缺失时用 `--runtime` 兜底）
+- 时长：`duration` / `runtime` / `时长` / `片长` / `分钟`（缺失时用 `--duration` 兜底）
 
-识别不到时用 `--en-col` / `--zh-col` / `--year-col` / `--runtime-col` 手动指定（可以填列名，也可以填序号）。
+识别不到时用 `--en-col` / `--zh-col` / `--year-col` / `--duration-col` 手动指定（可以填列名，也可以填序号）。
 
 ### 搜索与排序逻辑
 
@@ -184,8 +184,8 @@ pr-search --batch films.csv --top 5 --min-seeders 10 --out result.csv
    - 最终排名 = 质量分 × 相关性，相关性作为乘数压制噪音
 3.5 **码率过滤**（默认开启）：按分辨率设最低视频码率门槛
    （4K≥5000 / 1080p≥2000 / 720p≥1000 kbps）。Prowlarr 不提供码率和时长，
-   脚本用 `码率≈体积×8÷时长` 估算——时长取 CSV 的 `runtime` 列，缺失则用
-   `--runtime`（默认 100 分钟）。为避免误删，这是**偏宽松**的估算：用的是总码率
+   脚本用 `码率≈体积×8÷时长` 估算——时长取 CSV 的 `duration` 列，缺失则用
+   `--duration`（默认 100 分钟）。为避免误删，这是**偏宽松**的估算：用的是总码率
    （含音轨，略高于视频码率），且分辨率读不出或算不出码率的一律放行。
    用 `--keep-lowbitrate` 关闭。
 4. **回填**：每部片取前 `--top` 名，每个结果写入 4 列：
