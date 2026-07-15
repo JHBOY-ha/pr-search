@@ -25,6 +25,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -244,6 +245,29 @@ RES_SCORES = [
     (re.compile(r"\b720p\b", re.I), 2, "720p"),
     (re.compile(r"\b(480p|576p|sd)\b", re.I), 1, "480p"),
 ]
+# Pixel-dimension fallback: old rips label resolution as WxH (e.g. 320x240,
+# 640x480, 1280x720) instead of 1080p/720p. Map the *height* to a tier so a
+# 320x240 XviD is correctly graded as SD, not left unscored (which let it slip
+# past the bitrate gate and, being domestic, rank first). Height is the last
+# number; anamorphic widths vary so we key on height alone.
+_WxH_RE = re.compile(r"\b(\d{3,4})\s?[x×]\s?(\d{3,4})\b", re.I)
+
+
+def _res_from_dims(title):
+    """(score, label) from a WxH tag by height tier, or (0, '') if none."""
+    m = _WxH_RE.search(title)
+    if not m:
+        return 0, ""
+    h = int(m.group(2))
+    if h >= 1600:
+        return 4, "2160p"
+    if h >= 900:
+        return 3, "1080p"
+    if h >= 620:
+        return 2, "720p"
+    return 1, "480p"  # anything smaller (incl. 320x240) is SD
+
+
 SOURCE_SCORES = [
     (re.compile(r"\bremux\b", re.I), 6, "Remux"),
     (re.compile(r"\b(blu-?ray|bdrip|bdremux)\b", re.I), 5, "BluRay"),
@@ -270,6 +294,8 @@ def quality_of(r):
     """Derive resolution/source/codec + a weighted score from a result."""
     t = r.get("title") or ""
     res_s, res_l = _match_first(t, RES_SCORES)
+    if not res_l:  # no 2160p/1080p/... tag — try a WxH pixel-dimension tag
+        res_s, res_l = _res_from_dims(t)
     src_s, src_l = _match_first(t, SOURCE_SCORES)
     cod_s, cod_l = _match_first(t, CODEC_SCORES)
     seeders = r.get("seeders") or 0
@@ -353,6 +379,52 @@ def is_domestic(r):
     return len(_CJK_RE.findall(t)) >= 2 and not _KANA_RE.search(t)
 
 
+# Resolutions that earn a domestic release the --cn-first top slot. Below this
+# (480p/SD, or unreadable resolution), a domestic release is NOT floated ahead
+# of higher-quality foreign ones — otherwise a 320x240 XviD avi, being
+# "domestic", would outrank a 2160p release purely for having Chinese in its
+# title. Such low/unknown-quality domestic rips fall back to normal ranking.
+_CN_PRIORITY_RES = {"2160p", "1080p", "720p"}
+
+
+def cn_priority(r):
+    """True if this is a domestic release good enough to float to the top."""
+    return is_domestic(r) and quality_of(r)["resolution"] in _CN_PRIORITY_RES
+
+
+# ---- foreign-dub detection (primary audio is a non-original dub) -----------
+# Public RU/UKR/Indian trackers often ship a film whose FIRST audio track is a
+# dub (Russian voice-over, Ukrainian, generic "Dubbed", French VF…) rather than
+# the original. The user wants these dropped. Signals, from the title only:
+#   • Cyrillic text                → Russian/Ukrainian release
+#   • RU voice-over tags AVO/MVO/DVO/LVO (author/multi/dual/line voice-over)
+#   • Ukrainian as the *first* audio: [UKR_ENG] / [2xUKR_ENG] / [UKR] / Ukrainian
+#     — but NOT [ENG] or [ENG_UKR] (English primary, just hosted on a UKR site)
+#   • an explicit "Dubbed"/Dublado/Doblado/Doblada/Dublaj word
+#   • French dub tags TrueFrench / VFF / VFQ / VFI / VF2 (NOT VOSTFR = subbed)
+# Chinese releases (国语/国配/中字…) are the *wanted* kind of dub, so a domestic
+# release is never flagged. Deliberate limitation: a bare language name
+# (Persian, Hindi, Korean…) is NOT flagged — it is usually the film's *original*
+# language; only an explicit dub marker counts, to avoid dropping originals.
+_FOREIGN_DUB_RE = re.compile(
+    r"[Ѐ-ӿ]"                       # any Cyrillic char (RU/UKR)
+    r"|\b(?:AVO|MVO|DVO|LVO)\b"              # Russian voice-over tags
+    r"|\b(?:\d+x)?UKR(?=[_ \]]|$)|\bUkrainian\b"  # Ukrainian first (UKR_/2xUKR/[UKR])
+    r"|\bDubbed\b|\bDublado\b|\bDoblad[oa]\b|\bDublaj\b"  # generic dub words
+    r"|\bTrueFrench\b|\bVF[FQI2]\b",         # French dub (not VOSTFR)
+    re.I)
+
+
+def is_foreign_dub(r):
+    """True if the release's primary audio looks like a non-original foreign dub.
+
+    Never flags domestic (Chinese) releases — a Chinese dub is what we want.
+    """
+    if is_domestic(r):
+        return False
+    return bool(_FOREIGN_DUB_RE.search(r.get("title") or ""))
+
+
 # ---- disc-image / remux detection (poor playback compatibility) -----------
 # "Original disc" releases — full UHD/BD folder rips (BDMV/ISO) and Remuxes —
 # are huge (tens of GB) and often carry raw HEVC + Dolby Vision / lossless
@@ -388,7 +460,7 @@ def is_remux(r):
 
 # ---- bitrate quality gate (approximated from size / duration) -------------
 # The user wants to drop releases whose video bitrate is below a per-resolution
-# floor:  4K/2160p ≥5000 kbps · 1080p ≥2000 · 720p ≥1000.
+# floor:  4K/2160p ≥30000 kbps · 1080p ≥10000 · 720p ≥5000.
 #
 # Prowlarr gives no bitrate and no duration — only file size. So we approximate:
 #     bitrate_kbps ≈ size_bytes * 8 / duration_seconds / 1000
@@ -398,15 +470,18 @@ def is_remux(r):
 #     lower, so the estimate runs high — lenient, especially for multi-audio
 #     domestic releases.
 #   • A short default duration makes the estimate higher, not lower.
-# Anything whose resolution we can't read, or with no duration at all, is NOT
-# gated (returned as passing) — we never guess a file into deletion.
+# When quality can't be judged — resolution unreadable, or bitrate can't be
+# estimated (no size/duration) — the release passes only if it's a large file
+# (>10 GB), used as a proxy for acceptable quality. Any resolution below 720p
+# (480p/SD) is dropped outright.
 MIN_BITRATE = {  # kbps floor per resolution label (from quality_of)
-    "2160p": 5000,
-    "1080p": 2000,
-    "720p": 1000,
-    # 480p/SD left ungated — the standard table doesn't cover it.
+    "2160p": 30000,
+    "1080p": 10000,
+    "720p": 5000,
+    # Below 720p (480p/SD) is not listed → dropped by bitrate_ok, not gated.
 }
 DEFAULT_DURATION_MIN = 100  # fallback film length when none is known (minutes)
+FALLBACK_SIZE_BYTES = 10 * 1_000_000_000  # 10 GB — un-judgeable releases pass only if at least this large
 
 
 def est_bitrate_kbps(r, duration_min):
@@ -420,18 +495,22 @@ def est_bitrate_kbps(r, duration_min):
 def bitrate_ok(r, duration_min, table=None):
     """True if the release meets the per-resolution bitrate floor.
 
-    Passes (returns True) when the resolution is unknown/ungated or the bitrate
-    can't be estimated — the gate only ever *rejects* a file it can positively
-    judge as too low.
+    When quality can't be judged — resolution unreadable, or bitrate can't be
+    estimated — the release passes only if it's a large file (>10 GB), used as
+    a proxy for acceptable quality. Any resolution below 720p (480p/SD) is
+    dropped outright.
     """
     table = table if table is not None else MIN_BITRATE
     res = quality_of(r)["resolution"]
+    size = r.get("size") or 0
+    if not res:  # resolution unreadable → judge by file size
+        return size > FALLBACK_SIZE_BYTES
     floor = table.get(res)
     if not floor:
-        return True  # unknown or ungated resolution → don't judge
+        return False  # known resolution below 720p (480p/SD) → drop
     br = est_bitrate_kbps(r, duration_min)
-    if br is None:
-        return True  # no size/duration → can't judge → keep
+    if br is None:  # can't estimate bitrate → judge by file size
+        return size > FALLBACK_SIZE_BYTES
     return br >= floor
 
 
@@ -439,14 +518,42 @@ def bitrate_ok(r, duration_min, table=None):
 _WORD_RE = re.compile(r"[a-z0-9]+")
 _STOP = {"the", "a", "an", "of", "and", "in", "on", "to", "part"}
 
+# Leading release-site / group tags that precede the real title on public
+# indexers (e.g. "[47BT]新世界.New.World", "47BT.朗读者.The.Reader",
+# "【高清控联盟】蜘蛛侠3.Spider.Man.3"). Stripped before position analysis so a
+# genuine leading title isn't mistaken for a mid-title match. This is only for
+# the START-position heuristic; scoring still sees the original tokens.
+_SITE_TAG_RE = re.compile(
+    r"^\s*(?:"
+    r"[\[【](?=[^\]】]*[一-鿿])[^\]】]*[\]】]"  # bracket tag containing CJK
+    r"|[\[【][^\]】]*(?:BT|发布|论坛|字幕组|压制|高清|www)[^\]】]*[\]】]"  # site/group bracket
+    r"|www\.[a-z0-9-]+\.[a-z]{2,6}"  # explicit www.<domain>.<tld>
+    r"|47bt|52bt|\d+bt"              # bare site tags like 47BT / 52BT
+    r")[\s._-]*", re.I)
+# A leading Chinese title block (optionally with a trailing number, e.g.
+# "蜘蛛侠3", "复仇者联盟4") that precedes the English title on domestic
+# releases. Also stripped for position analysis so the English run starts at 0.
+_CN_TITLE_PREFIX_RE = re.compile(r"^\s*[一-鿿·:：\s]+\d*[\s._-]*")
+
+
+def _strip_site_tags(s):
+    """Remove leading site/group tags and a leading Chinese-title block from a
+    release title, so the English title's position can be judged fairly."""
+    prev = None
+    while s and s != prev:
+        prev = s
+        s = _SITE_TAG_RE.sub("", s, count=1)
+        s = _CN_TITLE_PREFIX_RE.sub("", s, count=1)
+    return s
+
 
 def _tokens(s):
     return [w for w in _WORD_RE.findall((s or "").lower()) if w not in _STOP]
 
 
 _EPISODE_RE = re.compile(
-    r"(\bS\d{1,2}E\d{1,2}\b|\bEP?\s?\d{1,3}\b|\s-\s\d{1,3}\b|"
-    r"\b\d{1,3}\s?集\b|\[\d{1,3}\])", re.I)
+    r"(\bS\d{1,2}E\d{1,2}\b|\bS\d{1,2}\b|\bEP?\s?\d{1,3}\b|[\s_]-[\s_]\d{1,3}(?!\d)|"
+    r"\b\d{1,3}\s?集\b|\bseason\s?\d{1,2}\b|第\s?\d{1,3}\s?[季集]|\[\d{1,3}\])", re.I)
 
 
 def _contiguous_run(q, toks):
@@ -484,13 +591,21 @@ def relevance(query_en, year, title):
     q = _tokens(query_en)
     if not q:
         return 0.0
-    toks = _tokens(title)
+    # Strip leading site/group tags first so a genuine leading title (e.g.
+    # "[47BT]新世界.New.World") isn't scored as a mid-title match.
+    toks = _tokens(_strip_site_tags(title or ""))
     score, start = _contiguous_run(q, toks)
     # The film title usually leads the release name. If the matched run starts
-    # deep inside the title (e.g. "Yellowstone" inside "Murder at Yellowstone
-    # City"), it's probably a different film that merely contains the word.
-    if start >= 2 and score >= 0.99:
-        score *= 0.5
+    # deep inside the title it's probably a *different* film that merely
+    # contains the query words:
+    #   • "Yellowstone" inside "Murder at Yellowstone City"  (start>=2)
+    #   • "Elvis" inside "Agent Elvis" / "Reinventing Elvis"  (start==1)
+    # For a SINGLE-word title this is especially unreliable — the word alone is
+    # weak evidence — so any non-leading match is penalised hard. For multi-word
+    # titles we only penalise a clearly-deep start (>=2), since a leading
+    # article/number can legitimately shift the run by one.
+    if score >= 0.99 and start >= 1:
+        score *= 0.35 if (len(q) == 1 or start >= 2) else 0.5
     if year and str(year).isdigit():
         years = set(_YEAR_RE.findall(title or ""))
         if years:
@@ -530,7 +645,7 @@ def search_retry(key, query, indexer_ids=None, categories=None, fetch=150,
     retry succeeds. HTTP errors (bad request etc.) are not retried.
     """
     last = None
-    for i in range(attempts):
+    for _ in range(attempts):
         try:
             return search(key, query, indexer_ids, categories, fetch)
         except SystemExit:
@@ -541,6 +656,24 @@ def search_retry(key, query, indexer_ids=None, categories=None, fetch=150,
 
 
 # ---- batch CSV processing --------------------------------------------------
+def _write_csv_atomic(path, header, rows):
+    """Write header+rows to `path` atomically (temp file + os.replace).
+
+    os.replace is atomic on the same filesystem, so a reader/observer sees
+    either the whole old file or the whole new file — never a truncated one.
+    This is how we snapshot progress after each filled row without ever
+    leaving the real output empty.
+    """
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8-sig") as f:
+        wr = csv.writer(f)
+        wr.writerow(header)
+        wr.writerows(rows)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 def _resolve_col(header, spec, default_names):
     """Map a --xxx-col spec (name or 1-based index) to a 0-based column index.
 
@@ -571,7 +704,8 @@ def batch(args, key):
     header = rows[0] if has_header else [f"col{i+1}" for i in range(len(rows[0]))]
     data = rows[1:] if has_header else rows
 
-    en_i = _resolve_col(header, args.en_col, ["title_en", "english", "en"])
+    en_i = _resolve_col(header, args.en_col,
+                        ["titleen", "title_en", "english", "en"])
     zh_i = _resolve_col(header, args.zh_col, ["title", "title_zh", "name", "电影名"])
     yr_i = _resolve_col(header, args.year_col, ["year", "年份", "年代"])
     rt_i = _resolve_col(header, args.duration_col,
@@ -581,173 +715,240 @@ def batch(args, key):
                  f"(header seen: {header}).")
 
     indexer_ids = args.indexer_ids.split(",") if args.indexer_ids else None
-    categories = args.categories.split(",") if args.categories else ["2000"]
+    # No category filter by default. Many releases (esp. foreign / classic /
+    # domestic-tagged films) are mislabelled or uncategorised on public
+    # indexers, so restricting to category 2000 (Movies) silently drops them —
+    # e.g. Tangerine/Peppermint Candy return 0 under 2000 but 40+ unfiltered.
+    # Title relevance (relevance()) already screens out unrelated hits, so we
+    # let category be opt-in via -c instead.
+    categories = args.categories.split(",") if args.categories else None
     topn = args.top
     min_seeders = args.min_seeders if args.min_seeders else 5  # batch default
 
-    # Build output header: original columns + magnet_N / info_N triples.
-    out_header = list(header)
+    # If the input CSV already carries a magnet_1..title_N block (e.g. a prior
+    # export or an earlier run written back into the same file), reuse those
+    # columns *in place* instead of appending a second, duplicate block. We
+    # treat everything from the first magnet_1 column onward as the mutable
+    # "extra" region; the columns before it are the untouched base data.
+    low_hdr = [h.strip().lower() for h in header]
+    mag_start = low_hdr.index("magnet_1") if "magnet_1" in low_hdr else None
+    base_header = header[:mag_start] if mag_start is not None else list(header)
+    base_ncols = len(base_header)
+
+    # Build output header: base columns + a fresh magnet_N block sized to --top.
+    out_header = list(base_header)
     for n in range(1, topn + 1):
         out_header += [f"magnet_{n}", f"quality_{n}", f"seeders_{n}", f"title_{n}"]
 
     out_path = args.out or (os.path.splitext(args.batch)[0] + "_magnets.csv")
 
-    # Resume: if the output already exists, count its data rows and skip that
-    # many input rows. Rows are written in input order, so a row count is a
-    # safe checkpoint. --restart forces a fresh run.
-    done = 0
-    if os.path.exists(out_path) and not args.restart:
-        with open(out_path, newline="", encoding="utf-8-sig") as f:
-            done = max(0, sum(1 for _ in f) - 1)
-        if done >= len(data):
-            print(f"All {len(data)} rows already done in {out_path} "
-                  f"(use --restart to redo).")
-            return
-        print(f"Resuming: {done} rows already in {out_path}, "
-              f"continuing from row {done + 1}.")
+    # Resume by *content*, not row count. A previous run may have written empty
+    # rows for films that returned nothing — sometimes because Prowlarr or an
+    # indexer hiccupped mid-run (silent HTTP-200 empty results), not because the
+    # film is truly absent. So we reuse only rows that already found a magnet;
+    # rows with an empty magnet_1 get (re-)searched. Re-running is self-healing.
+    #
+    # The whole table lives in memory as `out_rows` (one entry per input row).
+    # We never truncate the real file: after each row we (re)search, the full
+    # table is snapshotted via _write_csv_atomic (temp + atomic rename). So the
+    # output is complete at every instant — interrupt any time and every row
+    # searched so far is on disk; already-filled rows are skipped on re-run.
+    EXTRA_W = topn * 4
+    prev_good = {}  # 1-based input-row index -> saved extra cells
+    if not args.restart:
+        # (a) Seed from the magnet block embedded in the input CSV itself, so a
+        #     row that already has a magnet is reused rather than re-searched.
+        if mag_start is not None:
+            for i, drow in enumerate(data, 1):
+                ex = drow[mag_start:]
+                if ex and ex[0].strip():  # magnet_1 non-empty
+                    prev_good[i] = ex
+        # (b) A prior output file overrides — it's the freshest source.
+        if os.path.exists(out_path):
+            with open(out_path, newline="", encoding="utf-8-sig") as pf:
+                pr = list(csv.reader(pf))
+            if pr:
+                plow = [h.strip().lower() for h in pr[0]]
+                m1 = plow.index("magnet_1") if "magnet_1" in plow else None
+                for i, prow in enumerate(pr[1:], 1):
+                    if m1 is not None and m1 < len(prow) and prow[m1].strip():
+                        prev_good[i] = prow[m1:]  # this row's extra cells
+        if prev_good:
+            n_good = len(prev_good)
+            print(f"Resuming: {n_good} rows already have a magnet; "
+                  f"re-searching {len(data) - n_good} empty/new row(s).")
 
-    mode = "a" if done else "w"
-    f = open(out_path, mode, newline="", encoding="utf-8-sig")
-    w = csv.writer(f)
-    if not done:
-        w.writerow(out_header)
+    def _pad_extra(extra):
+        return (list(extra) + [""] * EXTRA_W)[:EXTRA_W]
+
+    def _base_of(row):
+        b = list(row[:base_ncols])
+        return b + [""] * (base_ncols - len(b))  # pad short rows
+
+    # Seed the in-memory table: each row = base input cells + extra cells
+    # (reused from a prior good run, else blank placeholders).
+    out_rows = []
+    for ri, row in enumerate(data, 1):
+        out_rows.append(_base_of(row) + _pad_extra(prev_good.get(ri, [])))
+    # Persist the seeded table once up front so the file is valid immediately.
+    _write_csv_atomic(out_path, out_header, out_rows)
 
     processed = 0
-    try:
-        for ri, row in enumerate(data, 1):
-            if ri <= done:
+    reused = len(prev_good)
+    searched_any = False  # gates the inter-search throttle
+    for ri, row in enumerate(data, 1):
+        row = _base_of(row)  # base columns only (drops any embedded magnet block)
+
+        # Skip rows a prior run already filled — they're seeded in out_rows.
+        if ri in prev_good:
+            continue
+
+        def cell(i):
+            return row[i].strip() if i is not None and i < len(row) else ""
+
+        title_en = cell(en_i)
+        title_zh = cell(zh_i)
+        year = cell(yr_i)
+        # Per-film duration for the bitrate estimate: use the CSV column if
+        # present & numeric, else fall back to --duration.
+        rt_raw = re.sub(r"[^\d]", "", cell(rt_i))  # tolerate "95 min" etc.
+        duration_min = int(rt_raw) if rt_raw else args.duration
+        label = title_en or title_zh or f"row{ri}"
+
+        # Query: prefer English name + year (best hit-rate on public trackers).
+        primary = title_en or title_zh
+        query = f"{primary} {year}".strip() if year else primary
+        log_pre = f"[{ri}/{len(data)}] {label!r:.50}"
+
+        if not primary:
+            print(f"{log_pre}  — no title, skipped", file=sys.stderr)
+            continue  # row already blank in out_rows
+
+        # Throttle between real searches: hammering Prowlarr back-to-back
+        # makes flaky indexers silently return empty result sets (the same
+        # query yields 60+ hits one moment and 0 the next). A fixed gap
+        # between requests lets them recover. Only sleep before an actual
+        # search, not for reused/skipped rows.
+        if searched_any and args.delay > 0:
+            time.sleep(args.delay)
+        searched_any = True
+
+        try:
+            raw = search_retry(key, query, indexer_ids, categories)
+        except SystemExit:
+            raise
+        except Exception as e:
+            print(f"{log_pre}  — search error (after retries): {e}", file=sys.stderr)
+            continue  # row stays blank in out_rows; a re-run will retry it
+
+        # Fallback: if EN+year found nothing, retry with EN alone, then ZH.
+        try:
+            if not raw and year and title_en:
+                raw = search_retry(key, title_en, indexer_ids, categories)
+            if not raw and title_zh and title_zh != primary:
+                raw = search_retry(key, f"{title_zh} {year}".strip(), indexer_ids, categories)
+        except SystemExit:
+            raise
+        except Exception:
+            pass  # keep whatever the primary query returned (possibly none)
+
+        # Flag indexers that report placeholder seeder counts so the
+        # seeder filter below doesn't wipe out every result from an
+        # aggregator site (52BT, BTdirectory, Magnet Cat …).
+        flag_unreliable_seeders(raw)
+
+        # Score every candidate, filter by seeders and title relevance.
+        cand = []
+        for r in raw:
+            seeders = r.get("seeders") or 0
+            # Only enforce --min-seeders where the count is trustworthy.
+            if not r.get("_seed_unknown") and seeders < min_seeders:
                 continue
-            row = list(row) + [""] * (len(header) - len(row))  # pad short rows
-
-            def cell(i):
-                return row[i].strip() if i is not None and i < len(row) else ""
-
-            title_en = cell(en_i)
-            title_zh = cell(zh_i)
-            year = cell(yr_i)
-            # Per-film duration for the bitrate estimate: use the CSV column if
-            # present & numeric, else fall back to --duration.
-            rt_raw = re.sub(r"[^\d]", "", cell(rt_i))  # tolerate "95 min" etc.
-            duration_min = int(rt_raw) if rt_raw else args.duration
-            label = title_en or title_zh or f"row{ri}"
-
-            # Query: prefer English name + year (best hit-rate on public trackers).
-            primary = title_en or title_zh
-            query = f"{primary} {year}".strip() if year else primary
-            log_pre = f"[{ri}/{len(data)}] {label!r:.50}"
-
-            if not primary:
-                print(f"{log_pre}  — no title, skipped", file=sys.stderr)
-                w.writerow(row + [""] * (topn * 4)); f.flush()
+            if args.no_hardsub and subtitle_of(r) == "hard":
                 continue
-
-            try:
-                raw = search_retry(key, query, indexer_ids, categories)
-            except SystemExit:
-                raise
-            except Exception as e:
-                print(f"{log_pre}  — search error (after retries): {e}", file=sys.stderr)
-                w.writerow(row + [""] * (topn * 4)); f.flush()
+            if args.no_remux and is_remux(r):
                 continue
+            if args.no_foreign_dub and is_foreign_dub(r):
+                continue
+            if args.min_bitrate and not bitrate_ok(r, duration_min):
+                continue
+            rel = relevance(title_en or title_zh, year, r.get("title"))
+            if rel < args.min_relevance:
+                continue
+            q = quality_of(r)
+            # Relevance is a multiplier, not additive: a weak title match
+            # can't be rescued by a high seeder count. Full matches keep
+            # their quality score.
+            r["_rank"] = q["score"] * rel
+            r["_q"] = q
+            r["_rel"] = rel
+            r["_cn"] = is_domestic(r)
+            # Only domestic releases at 720p+ earn the --cn-first top slot; a
+            # low/unknown-res domestic rip (e.g. 320x240 XviD) must not outrank
+            # a 2160p foreign one just for being domestic.
+            r["_cn_pri"] = r["_cn"] and q["resolution"] in _CN_PRIORITY_RES
+            cand.append(r)
 
-            # Fallback: if EN+year found nothing, retry with EN alone, then ZH.
-            try:
-                if not raw and year and title_en:
-                    raw = search_retry(key, title_en, indexer_ids, categories)
-                if not raw and title_zh and title_zh != primary:
-                    raw = search_retry(key, f"{title_zh} {year}".strip(), indexer_ids, categories)
-            except SystemExit:
-                raise
-            except Exception:
-                pass  # keep whatever the primary query returned (possibly none)
+        # Tie-break sort key: real seeders descending, unknown counts last.
+        def _seed_tb(x):
+            return -1 if x.get("_seed_unknown") else (x.get("seeders") or 0)
+        # --cn-first floats *quality-passing* domestic releases to the top,
+        # ordered among themselves (and among the rest) by rank then seeders.
+        if args.cn_first:
+            cand.sort(key=lambda x: (0 if x["_cn_pri"] else 1,
+                                     -x["_rank"], -_seed_tb(x)))
+        else:
+            cand.sort(key=lambda x: (-x["_rank"], -_seed_tb(x)))
 
-            # Flag indexers that report placeholder seeder counts so the
-            # seeder filter below doesn't wipe out every result from an
-            # aggregator site (52BT, BTdirectory, Magnet Cat …).
-            flag_unreliable_seeders(raw)
+        # Walk candidates best-first; keep only those that resolve to a
+        # real magnet: link. A proxy URL that fails to parse is skipped
+        # rather than written as a dead link, so we fall through to the
+        # next-best candidate until we have topn good ones.
+        picks = []
+        for r in cand:
+            if len(picks) >= topn:
+                break
+            mag = resolve_magnet(r, key)
+            if not mag.startswith("magnet:"):
+                continue
+            r["_magnet"] = mag
+            picks.append(r)
 
-            # Score every candidate, filter by seeders and title relevance.
-            cand = []
-            for r in raw:
-                seeders = r.get("seeders") or 0
-                # Only enforce --min-seeders where the count is trustworthy.
-                if not r.get("_seed_unknown") and seeders < min_seeders:
-                    continue
-                if args.no_hardsub and subtitle_of(r) == "hard":
-                    continue
-                if args.no_remux and is_remux(r):
-                    continue
-                if args.min_bitrate and not bitrate_ok(r, duration_min):
-                    continue
-                rel = relevance(title_en or title_zh, year, r.get("title"))
-                if rel < args.min_relevance:
-                    continue
-                q = quality_of(r)
-                # Relevance is a multiplier, not additive: a weak title match
-                # can't be rescued by a high seeder count. Full matches keep
-                # their quality score.
-                r["_rank"] = q["score"] * rel
-                r["_q"] = q
-                r["_rel"] = rel
-                r["_cn"] = is_domestic(r)
-                cand.append(r)
+        extra = []
+        for r in picks:
+            q = r["_q"]
+            sub = subtitle_of(r)
+            sub_tag = {"hard": "内嵌", "soft": "内封", "cn": "中字"}.get(sub, "")
+            bits = [q["resolution"], q["source"], q["codec"]]
+            if r.get("_cn"):
+                bits.append("国内")
+            if is_remux(r):
+                bits.append("原盘")
+            if sub_tag:
+                bits.append(sub_tag)
+            qtag = "/".join(x for x in bits if x)
+            sd = seeders_display(r)
+            seed_cell = "?" if sd is None else str(sd)
+            extra += [r["_magnet"], qtag, seed_cell, r.get("title") or ""]
+        extra += [""] * ((topn - len(picks)) * 4)  # pad to fixed width
 
-            # Tie-break sort key: real seeders descending, unknown counts last.
-            def _seed_tb(x):
-                return -1 if x.get("_seed_unknown") else (x.get("seeders") or 0)
-            # --cn-first floats domestic releases to the top, ordered among
-            # themselves (and among the rest) by rank then seeders.
-            if args.cn_first:
-                cand.sort(key=lambda x: (0 if x["_cn"] else 1,
-                                         -x["_rank"], -_seed_tb(x)))
-            else:
-                cand.sort(key=lambda x: (-x["_rank"], -_seed_tb(x)))
+        # Update this row in the in-memory table and snapshot the whole file
+        # atomically. The output is therefore complete after every filled row.
+        out_rows[ri - 1] = row + extra
+        _write_csv_atomic(out_path, out_header, out_rows)
+        processed += 1
 
-            # Walk candidates best-first; keep only those that resolve to a
-            # real magnet: link. A proxy URL that fails to parse is skipped
-            # rather than written as a dead link, so we fall through to the
-            # next-best candidate until we have topn good ones.
-            picks = []
-            for r in cand:
-                if len(picks) >= topn:
-                    break
-                mag = resolve_magnet(r, key)
-                if not mag.startswith("magnet:"):
-                    continue
-                r["_magnet"] = mag
-                picks.append(r)
+        if picks:
+            bsd = seeders_display(picks[0])
+            status = (f"{len(picks)} pick(s), best="
+                      f"{picks[0]['_q']['resolution'] or '?'} "
+                      f"S:{'?' if bsd is None else bsd}")
+        else:
+            status = "no match"
+        print(f"{log_pre}  — {len(cand)} candidates → {status}")
 
-            extra = []
-            for r in picks:
-                q = r["_q"]
-                sub = subtitle_of(r)
-                sub_tag = {"hard": "内嵌", "soft": "内封", "cn": "中字"}.get(sub, "")
-                bits = [q["resolution"], q["source"], q["codec"]]
-                if r.get("_cn"):
-                    bits.append("国内")
-                if is_remux(r):
-                    bits.append("原盘")
-                if sub_tag:
-                    bits.append(sub_tag)
-                qtag = "/".join(x for x in bits if x)
-                sd = seeders_display(r)
-                seed_cell = "?" if sd is None else str(sd)
-                extra += [r["_magnet"], qtag, seed_cell, r.get("title") or ""]
-            extra += [""] * ((topn - len(picks)) * 4)  # pad to fixed width
-            w.writerow(row + extra); f.flush()
-            processed += 1
-
-            if picks:
-                bsd = seeders_display(picks[0])
-                status = (f"{len(picks)} pick(s), best="
-                          f"{picks[0]['_q']['resolution'] or '?'} "
-                          f"S:{'?' if bsd is None else bsd}")
-            else:
-                status = "no match"
-            print(f"{log_pre}  — {len(cand)} candidates → {status}")
-    finally:
-        f.close()
-    print(f"\nDone. Processed {processed} rows this run → {out_path}")
+    print(f"\nDone. Reused {reused} prior row(s), searched {processed} this run "
+          f"→ {out_path}")
 
 
 def main():
@@ -774,11 +975,17 @@ def main():
                     help="drop disc images / remuxes (原盘/Remux/BDMV, huge & poor player compatibility; default on)")
     ap.add_argument("--remux", dest="no_remux", action="store_false",
                     help="keep disc images / remuxes in results")
+    # Foreign-dub gate: default on. Drops releases whose primary audio looks like
+    # a non-original dub (Russian/Ukrainian/generic Dubbed/French VF).
+    ap.add_argument("--no-foreign-dub", dest="no_foreign_dub", action="store_true", default=True,
+                    help="drop foreign-dubbed releases (Cyrillic/AVO-MVO-DVO/ukr/Dubbed/VFF; default on)")
+    ap.add_argument("--keep-foreign-dub", dest="no_foreign_dub", action="store_false",
+                    help="keep foreign-dubbed (俄配/乌配/外语配音) releases")
     # Bitrate gate: default on. --keep-lowbitrate opts out; --duration sets the
     # assumed film length used to estimate bitrate from file size.
     ap.add_argument("--min-bitrate", dest="min_bitrate", action="store_true", default=True,
                     help="drop releases below the per-resolution bitrate floor "
-                         "(4K≥5000/1080p≥2000/720p≥1000 kbps; default on)")
+                         "(4K≥30000/1080p≥10000/720p≥5000 kbps; default on)")
     ap.add_argument("--keep-lowbitrate", dest="min_bitrate", action="store_false",
                     help="keep low-bitrate releases (disable the bitrate gate)")
     ap.add_argument("--duration", type=int, metavar="MIN", default=DEFAULT_DURATION_MIN,
@@ -797,6 +1004,9 @@ def main():
     b.add_argument("--batch", metavar="CSV", help="input CSV to process row by row")
     b.add_argument("--out", metavar="CSV", help="output path (default: <input>_magnets.csv)")
     b.add_argument("--top", type=int, default=3, help="magnets to keep per film (default 3)")
+    b.add_argument("--delay", type=float, default=5.0, metavar="SEC",
+                   help="seconds to wait between searches so flaky indexers "
+                        "recover (default 5; set 0 to disable)")
     b.add_argument("--min-relevance", type=float, default=0.85,
                    help="min title match 0..1 to accept a result (default 0.85)")
     b.add_argument("--restart", action="store_true",
@@ -850,6 +1060,9 @@ def main():
     if args.no_remux:
         results = [r for r in results if not is_remux(r)]
 
+    if args.no_foreign_dub:
+        results = [r for r in results if not is_foreign_dub(r)]
+
     if args.min_bitrate:
         results = [r for r in results if bitrate_ok(r, args.duration)]
 
@@ -863,9 +1076,10 @@ def main():
         "age": lambda r: (r.get("ageHours") if r.get("ageHours") is not None else 1e12),
     }
     base = keymap[args.sort]
-    # --cn-first is a primary sort key layered on top of the chosen sort: all
-    # domestic releases float up, ordered among themselves by the base key.
-    sort_key = (lambda r: (0 if is_domestic(r) else 1, base(r))) if args.cn_first else base
+    # --cn-first is a primary sort key layered on top of the chosen sort:
+    # quality-passing domestic releases (720p+) float up, ordered among
+    # themselves by the base key. Low/unknown-res domestic rips are not floated.
+    sort_key = (lambda r: (0 if cn_priority(r) else 1, base(r))) if args.cn_first else base
     results.sort(key=sort_key)
     results = results[: args.limit]
 

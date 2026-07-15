@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 *.torrent
+
+# one-off enrichment script: embeds a TMDb API key + hardcoded local paths
+enrich_year.py
